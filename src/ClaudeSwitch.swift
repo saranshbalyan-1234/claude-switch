@@ -61,6 +61,7 @@ final class App: NSObject, ObservableObject, NSApplicationDelegate, NSPopoverDel
     @Published var resetWeekOn: Bool { didSet { defaults.set(resetWeekOn, forKey: "resetWeekOn") } }        // notify when the weekly limit resets
     @Published var notchOn: Bool { didSet { defaults.set(notchOn, forKey: "notchOn"); notch?.update() } }
     @Published var notchAlways: Bool { didSet { defaults.set(notchAlways, forKey: "notchAlways"); notch?.update() } }
+    @Published var notchHide: Int { didSet { defaults.set(notchHide, forKey: "notchHide") } }  // seconds the notch stays open for a new request; 0 = until answered
     @Published var muteUntil: Date? { didSet { mutedUntil = muteUntil } }
     @Published var waitingOn: Bool {
         didSet {
@@ -114,6 +115,7 @@ final class App: NSObject, ObservableObject, NSApplicationDelegate, NSPopoverDel
         resetWeekOn = d.object(forKey: "resetWeekOn") as? Bool ?? true
         notchOn = d.object(forKey: "notchOn") as? Bool ?? true
         notchAlways = d.bool(forKey: "notchAlways")
+        notchHide = d.object(forKey: "notchHide") as? Int ?? 15
         muteUntil = mutedUntil
         waitingOn = !FileManager.default.fileExists(atPath: attentionOffPath)
         approvalsOn = FileManager.default.fileExists(atPath: approvalsOnPath)

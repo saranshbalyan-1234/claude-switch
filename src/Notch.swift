@@ -11,6 +11,8 @@ final class NotchModel: ObservableObject {
     @Published var notchHeight: CGFloat = 32
     @Published var hasNotch = true
     @Published var contentHeight: CGFloat = 200
+    @Published var hideAt: Date?          // when an auto-opened island folds away by itself; nil: no countdown (or paused)
+    @Published var hideAfter: TimeInterval = 15
     @Published var wings = true  // the parts beside the notch; shown only while there's something to show, so menu bar icons stay visible
     var wing: CGFloat { 52 }
     var collapsedSize: CGSize { CGSize(width: notchWidth + (wings || !hasNotch ? wing * 2 : 0), height: notchHeight) }
@@ -82,8 +84,8 @@ final class Notch {
         let visible = app.notchOn && (app.notchAlways || active || model.expanded || model.hasNotch)
         // New requests open the island until they're answered, unless hidden with the chevron.
         let open = app.requests.filter { !dismissed.contains($0.id) }
-        if !open.isEmpty && !pinned { pinned = true; setExpanded(true) }
-        if open.isEmpty && pinned { pinned = false; if hoverSince == nil { setExpanded(false) } }
+        if !open.isEmpty && !pinned { pinned = true; setExpanded(true); startCountdown() }
+        if open.isEmpty && pinned { pinned = false; model.hideAt = nil; if hoverSince == nil { setExpanded(false) } }
         if !model.hasNotch && !(app.notchAlways || active || model.expanded) { panel.orderOut(nil) }
         dismissed.formIntersection(Set(app.requests.map(\.id)))
         if visible {
@@ -98,9 +100,17 @@ final class Notch {
 
     func attention() { update() }
 
+    // An island that opened by itself for a request folds away after the time set in Settings (the request stays in the
+    // panel and the menu bar). Pointing at it pauses the countdown; leaving starts it again from the full time.
+    func startCountdown() {
+        model.hideAfter = TimeInterval(app.notchHide)
+        model.hideAt = app.notchHide > 0 ? Date().addingTimeInterval(model.hideAfter) : nil
+    }
+
     func dismiss() {
         dismissed.formUnion(app.requests.map(\.id))
         pinned = false
+        model.hideAt = nil
         setExpanded(false)
     }
 
@@ -130,10 +140,12 @@ final class Notch {
         let inside = panel.frame.insetBy(dx: -2, dy: -2).contains(NSEvent.mouseLocation)
         if inside {
             outSince = nil
-            if hoverSince == nil { hoverSince = Date() }
+            if hoverSince == nil { hoverSince = Date(); if pinned { model.hideAt = nil } }  // pointing at it pauses the countdown
             if !model.expanded, Date().timeIntervalSince(hoverSince!) > 0.15 { setExpanded(true) }
         } else {
+            if hoverSince != nil && pinned && model.hideAt == nil { startCountdown() }  // left it: start again from the full time
             hoverSince = nil
+            if pinned, let at = model.hideAt, Date() >= at { dismiss() }
             if model.expanded && !pinned {
                 if outSince == nil { outSince = Date() }
                 if Date().timeIntervalSince(outSince!) > 0.35 { outSince = nil; setExpanded(false) }
@@ -159,6 +171,29 @@ struct NotchShape: Shape {
         p.addQuadCurve(to: CGPoint(x: r.maxX, y: r.minY), control: CGPoint(x: r.maxX - top, y: r.minY))
         p.closeSubpath()
         return p
+    }
+}
+
+// How long until the auto-opened island folds away: a bar that shrinks from full to empty.
+struct CountdownBar: View {
+    let end: Date
+    let total: TimeInterval
+    var body: some View {
+        TimelineView(.animation(minimumInterval: 1.0 / 30)) { ctx in
+            let left = max(0, end.timeIntervalSince(ctx.date)), f = total > 0 ? left / total : 0
+            HStack(spacing: 8) {
+                GeometryReader { g in
+                    ZStack(alignment: .leading) {
+                        Capsule().fill(Color.white.opacity(0.12))
+                        Capsule().fill(brand).frame(width: g.size.width * f)
+                    }
+                }
+                .frame(height: 3)
+                Text("\(Int(left.rounded(.up)))s").font(.system(size: 10, weight: .medium).monospacedDigit()).foregroundStyle(.secondary)
+                    .frame(width: 24, alignment: .trailing)
+            }
+            .help("Folds away when this runs out; point at it to pause. The request stays in the panel.")
+        }
     }
 }
 
@@ -257,11 +292,12 @@ struct NotchView: View {
                 .background(GeometryReader { g in Color.clear.preference(key: HeightKey.self, value: g.size.height) })
             }
             .frame(maxHeight: 460)
+            if let at = model.hideAt { CountdownBar(end: at, total: model.hideAfter) }
         }
         .padding(.top, model.notchHeight + 6)
         .padding(.horizontal, 18).padding(.bottom, 16)
         .onPreferenceChange(HeightKey.self) { h in
-            let total = h + 34 + 6 + 16 + 10
+            let total = h + 34 + 6 + 16 + 10 + 16  // header, gaps, padding, and room for the countdown bar
             if abs(total - model.contentHeight) > 1 {
                 model.contentHeight = total
                 (NSApp.delegate as? App)?.notch?.place()

@@ -396,6 +396,16 @@ struct NotchSettings: View {
                     }
                     .pickerStyle(.segmented).labelsHidden().fixedSize().disabled(!app.notchOn)
                 }
+                Row(label: "When it opens for a request, hide after", note: "A bar counts down; pointing at it pauses. The request stays in the panel.") {
+                    Picker("", selection: $app.notchHide) {
+                        Text("10 seconds").tag(10)
+                        Text("15 seconds").tag(15)
+                        Text("30 seconds").tag(30)
+                        Text("1 minute").tag(60)
+                        Text("Never").tag(0)
+                    }
+                    .labelsHidden().fixedSize().disabled(!app.notchOn)
+                }
             }
         }
     }
