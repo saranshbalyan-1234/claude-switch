@@ -273,6 +273,9 @@ struct Request: Identifiable, Equatable {
     func answer(_ text: String) {
         try? text.write(toFile: requestsPath + "/" + id + ".answer", atomically: true, encoding: .utf8)
     }
+    func answer(message: String) {
+        if let data = try? JSONSerialization.data(withJSONObject: ["message": message]), let s = String(data: data, encoding: .utf8) { answer(s) }
+    }
     func answer(_ answers: [(question: String, answer: String)]) {
         let list = answers.map { ["question": $0.question, "answer": $0.answer] }
         if let data = try? JSONSerialization.data(withJSONObject: ["answers": list]), let s = String(data: data, encoding: .utf8) { answer(s) }

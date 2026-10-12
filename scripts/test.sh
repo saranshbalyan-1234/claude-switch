@@ -186,6 +186,7 @@ $S rules list | grep -qxF 'Bash(npm test:*)' || fail "rules: always adds npm tes
 answer always; r '{"hook_event_name":"PermissionRequest","tool_name":"Bash","tool_input":{"command":"ls"},"permission_suggestions":[{"type":"addRules","rules":[{"toolName":"Bash","ruleContent":"ls:*"}]}]}' \
   | grep -q '"updatedPermissions"' || fail "request: always passes Claude's suggestion"; wait
 $S rules remove 'Bash(npm test:*)' >/dev/null; [ -z "$($S rules list)" ] || fail "rules remove"
+answer '{"message":"use yarn instead"}'; r "$perm" | grep -q 'said: use yarn instead' || fail "request: typed reply to a permission"; wait
 answer dismiss; r '{"hook_event_name":"PreToolUse","tool_name":"AskUserQuestion","tool_input":{"questions":[{"question":"Q?"}]}}' | grep -q 'dismissed' || fail "request: dismiss"; wait
 ( for _ in $(seq 40); do f=$(ls "$d"/requests/*.json 2>/dev/null | head -1); [ -n "$f" ] && break; sleep 0.1; done
   jq -r .diff "$f" > "$d/diff"; printf deny > "${f%.json}.answer" ) &

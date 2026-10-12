@@ -637,6 +637,11 @@ final class App: NSObject, ObservableObject, NSApplicationDelegate, NSPopoverDel
         requests.removeAll { $0.id == r.id }
         updateTitle()
     }
+    func answer(_ r: Request, message: String) {
+        r.answer(message: message)
+        requests.removeAll { $0.id == r.id }
+        updateTitle()
+    }
     func answer(_ r: Request, _ answers: [(question: String, answer: String)]) {
         r.answer(answers)
         requests.removeAll { $0.id == r.id }

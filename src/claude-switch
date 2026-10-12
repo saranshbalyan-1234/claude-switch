@@ -313,7 +313,7 @@ if [ "${1:-}" = request ]; then
                   options: [(.options // [])[] | {label: (.label // ""), description: (.description // "")}]}]}' <<<"$in" > "$r.tmp" \
     && mv -f "$r.tmp" "$r.json" || exit 0
   # The app answers by writing $r.answer: allow, always, deny, claude (ask in Claude), dismiss (a question, unanswered),
-  # or for a question {"answers":[...]}. How long to wait is set in the app (default 5 minutes).
+  # {"message": "..."} (a permission declined with what to do instead), or for a question {"answers":[...]}. How long to wait is set in the app (default 5 minutes).
   wait=${CLAUDE_SWITCH_REQUEST_WAIT:-$(cat "$WAIT_FILE" 2>/dev/null)}; wait=${wait:-300}
   for ((i = 0; i < wait * 10; i++)); do [ -s "$r.answer" ] && break; sleep 0.1; done
   ans=$(cat "$r.answer" 2>/dev/null); rm -f "$r.json" "$r.answer"
@@ -330,6 +330,9 @@ if [ "${1:-}" = request ]; then
         echo "$allow"
       fi ;;
     permission:deny) echo '{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"deny","message":"Denied from Claude Switch"}}}' ;;
+    permission:\{*)  # a typed reply: not this, and what to do instead
+      jq -c '{hookSpecificOutput: {hookEventName: "PermissionRequest", decision: {behavior: "deny",
+        message: ("The user declined this in Claude Switch and said: " + (.message // ""))}}}' <<<"$ans" 2>/dev/null ;;
     question:dismiss)
       echo '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"The user dismissed this question in Claude Switch without answering. Carry on with your best judgement, or ask again differently if you must."}}' ;;
     question:\{*)

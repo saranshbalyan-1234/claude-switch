@@ -345,6 +345,7 @@ struct PermissionCard: View {
     var dark = false
     var primary = false  // the first card takes Return (Allow) and Escape (Deny)
     @State private var hint: String?
+    @State private var reply = ""
     var body: some View {
         Card {
             VStack(alignment: .leading, spacing: 10) {
@@ -376,9 +377,26 @@ struct PermissionCard: View {
                         .keyboardShortcut(primary ? .defaultAction : nil)
                         .hint("Allow it this once" + (primary ? " (Return, or ⌃⌥⌘A from anywhere)" : ""), $hint)
                 }
+                // Or answer in words: Claude doesn't do this, and gets what you typed as what to do instead.
+                HStack(spacing: 6) {
+                    TextField("Or tell Claude what to do instead…", text: $reply)
+                        .textFieldStyle(.roundedBorder).font(.system(size: 12))
+                        .onSubmit(sendReply)
+                    Button { sendReply() } label: { Image(systemName: "arrow.up.circle.fill").font(.system(size: 18)) }
+                        .buttonStyle(.plain).foregroundStyle(reply.trimmingCharacters(in: .whitespaces).isEmpty ? Color.secondary : brand)
+                        .disabled(reply.trimmingCharacters(in: .whitespaces).isEmpty)
+                        .hint("Send: Claude doesn't do this, and gets your message as what to do instead", $hint)
+                }
                 HintLine(text: hint)
             }
         }
+    }
+}
+
+extension PermissionCard {
+    func sendReply() {
+        let t = reply.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !t.isEmpty { app.answer(r, message: t) }
     }
 }
 
