@@ -49,7 +49,6 @@ final class App: NSObject, ObservableObject, NSApplicationDelegate, NSPopoverDel
     @Published var barModes: String { didSet { defaults.set(barModes, forKey: "barModes"); updateTitle() } }
     @Published var barLabels: String { didSet { defaults.set(barLabels, forKey: "barLabels"); updateTitle() } }
     @Published var barDelimiter: String { didSet { defaults.set(barDelimiter, forKey: "barDelimiter"); updateTitle() } }
-    @Published var resetOff: Set<String> { didSet { defaults.set(Array(resetOff), forKey: "resetOff") } }
     @Published var hotKeyOn: Bool { didSet { defaults.set(hotKeyOn, forKey: "hotKey"); registerHotKeys() } }
     @Published var jumpKeyOn: Bool { didSet { defaults.set(jumpKeyOn, forKey: "jumpKey"); registerHotKeys() } }
     @Published var allowKeyOn: Bool { didSet { defaults.set(allowKeyOn, forKey: "allowKey"); registerHotKeys() } }
@@ -103,7 +102,7 @@ final class App: NSObject, ObservableObject, NSApplicationDelegate, NSPopoverDel
         barModes = d.string(forKey: "barModes") ?? "both"
         barLabels = d.string(forKey: "barLabels") ?? "full"
         barDelimiter = d.string(forKey: "barDelimiter") ?? " · "
-        resetOff = Set(d.stringArray(forKey: "resetOff") ?? [])
+        d.removeObject(forKey: "resetOff")  // per-account reset settings are gone: resets are set once, in General
         hotKeyOn = d.object(forKey: "hotKey") as? Bool ?? true
         jumpKeyOn = d.object(forKey: "jumpKey") as? Bool ?? true
         allowKeyOn = d.object(forKey: "allowKey") as? Bool ?? true
@@ -298,16 +297,8 @@ final class App: NSObject, ObservableObject, NSApplicationDelegate, NSPopoverDel
         return out
     }
 
-    // Reset notifications: on for this window in General, and not turned off for this account (both windows, or this one).
-    func resetsOn(_ account: String, _ key: String) -> Bool {
-        (key == "5h" ? resetSessionOn : resetWeekOn) && !resetOff.contains(account) && !resetOff.contains("\(account) \(key)")
-    }
-    func setResets(_ account: String, _ key: String, _ on: Bool) {
-        var s = resetOff
-        if s.remove(account) != nil { s.insert("\(account) \(key == "5h" ? "7d" : "5h")"); s.insert("\(account) \(key)") }  // split the old both-off setting
-        if on { s.remove("\(account) \(key)") } else { s.insert("\(account) \(key)") }
-        resetOff = s
-    }
+    // Reset notifications: one setting per window (5-hour and week) in General, for every account.
+    func resetsOn(_ account: String, _ key: String) -> Bool { key == "5h" ? resetSessionOn : resetWeekOn }
 
     // From this window's readings over the last hour (session) or 12 hours (week); nil until there are 10+ minutes of them.
     func pace(_ a: String, session: Bool) -> String? {

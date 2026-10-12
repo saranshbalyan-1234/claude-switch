@@ -67,10 +67,10 @@ if CommandLine.arguments.contains("--selftest") {
     t.history = [a: [Sample(at: now.addingTimeInterval(-120), s: 30, w: 38)]]
     expect(t.pace(a, session: true) == nil, "no pace from under 10 minutes")
     // Resets: announced once, when the last seen reset time has passed.
-    t.resetOff = []; t.resetSeen = ["\(a) 5h": now.addingTimeInterval(-60)]
+    t.resetSessionOn = true; t.resetSeen = ["\(a) 5h": now.addingTimeInterval(-60)]
     expect(t.resets(a, u(0, 40, in3h, in3h)) == ["Session (5h) limit has reset: back to full"], "reset announced")
     expect(t.resets(a, u(1, 40, in3h, in3h)).isEmpty, "reset announced once")
-    t.resetSeen = ["\(a) 5h": now.addingTimeInterval(-60)]; t.resetOff = [a]
+    t.resetSeen = ["\(a) 5h": now.addingTimeInterval(-60)]; t.resetSessionOn = false
     expect(t.resets(a, u(0, 40, in3h, in3h)).isEmpty, "reset notifications can be turned off")
     // Suggestion: the other account with the most room, only if it has more than this one.
     t.accounts = [a, "b", "c"]; t.email = a; t.usage = u(90, 50)

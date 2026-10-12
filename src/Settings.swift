@@ -7,13 +7,41 @@ struct SettingsGroup<Content: View>: View {
     var title: String? = nil
     var footer: String? = nil
     @ViewBuilder var content: Content
+    // Titled groups fold up like an accordion (closed until opened; remembered); untitled ones are always open.
+    @State private var open: Bool? = nil
+    var isOpen: Bool { title == nil || (open ?? SettingsGroup.opened.contains(title!)) }
+    static var opened: Set<String> {
+        get { Set(UserDefaults.standard.stringArray(forKey: "openGroups") ?? ["Approvals"]) }  // the one that matters most starts open
+        set { UserDefaults.standard.set(Array(newValue), forKey: "openGroups") }
+    }
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            if let title { SectionTitle(title) }
-            Card(padding: 0) {
-                _VariadicView.Tree(Rows()) { content }
+            if let title {
+                Button {
+                    let now = !isOpen
+                    withAnimation(.easeInOut(duration: 0.18)) { open = now }
+                    if now { SettingsGroup.opened.insert(title) } else { SettingsGroup.opened.remove(title) }
+                } label: {
+                    HStack(spacing: 6) {
+                        Text(title.uppercased()).font(.system(size: 10.5, weight: .semibold)).tracking(0.6).foregroundStyle(.secondary)
+                        Spacer()
+                        Image(systemName: "chevron.right").font(.system(size: 10, weight: .semibold)).foregroundStyle(.tertiary)
+                            .rotationEffect(.degrees(isOpen ? 90 : 0))
+                    }
+                    .padding(.horizontal, 4).padding(.vertical, 6)
+                    .background(RoundedRectangle(cornerRadius: 6).fill(Color.primary.opacity(isOpen ? 0 : 0.035)))
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help(isOpen ? "Hide \(title)" : "Show \(title)")
             }
-            if let footer { Text(footer).font(.system(size: 11)).foregroundStyle(.secondary).padding(.horizontal, 4).fixedSize(horizontal: false, vertical: true) }
+            if isOpen {
+                Card(padding: 0) {
+                    _VariadicView.Tree(Rows()) { content }
+                }
+                .transition(.opacity.combined(with: .move(edge: .top)))
+                if let footer { Text(footer).font(.system(size: 11)).foregroundStyle(.secondary).padding(.horizontal, 4).fixedSize(horizontal: false, vertical: true) }
+            }
         }
     }
     struct Rows: _VariadicView_MultiViewRoot {
@@ -312,7 +340,7 @@ struct ClaudeSettings: View {
                     }
                 }
             }
-            SettingsGroup(title: "Approvals", footer: "While Claude Switch isn't running, Claude asks the usual way. \"Answer in Claude\" on any request hands it back.") {
+            SettingsGroup(title: "Approvals", footer: "While Claude Switch isn't running, Claude asks the usual way. ✕ on any request hands it back to Claude's window.") {
                 Row(label: "Answer prompts and questions here",
                     note: "Allow or deny what Claude wants to do, and answer its questions, from the panel, the notch or the notification.") {
                     Switch(isOn: $app.approvalsOn).disabled(!installed)
@@ -428,14 +456,6 @@ struct AccountDetail: View {
                         if ![15, 30, 60, 120, 300].contains(app.intervalFor(a)) { Text("\(app.intervalFor(a)) seconds").tag(app.intervalFor(a)) }
                     }
                     .labelsHidden().fixedSize()
-                }
-            }
-            SettingsGroup(title: "Notify when limits reset", footer: app.resetSessionOn && app.resetWeekOn ? nil : "Turned off for every account in General → Notifications.") {
-                Row(label: "Session (5-hour) limit") {
-                    Switch(isOn: Binding(get: { app.resetsOn(a, "5h") }, set: { app.setResets(a, "5h", $0) })).disabled(!app.resetSessionOn)
-                }
-                Row(label: "Weekly limit") {
-                    Switch(isOn: Binding(get: { app.resetsOn(a, "7d") }, set: { app.setResets(a, "7d", $0) })).disabled(!app.resetWeekOn)
                 }
             }
             SettingsGroup(title: "Alerts") {
