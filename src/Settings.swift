@@ -19,7 +19,7 @@ struct SettingsGroup<Content: View>: View {
             if let title {
                 Button {
                     let now = !isOpen
-                    withAnimation(.easeInOut(duration: 0.18)) { open = now }
+                    withAnimation(.easeOut(duration: 0.16)) { open = now }
                     if now { SettingsGroup.opened.insert(title) } else { SettingsGroup.opened.remove(title) }
                 } label: {
                     HStack(spacing: 6) {
@@ -39,7 +39,7 @@ struct SettingsGroup<Content: View>: View {
                 Card(padding: 0) {
                     _VariadicView.Tree(Rows()) { content }
                 }
-                .transition(.opacity.combined(with: .move(edge: .top)))
+                .transition(.asymmetric(insertion: .opacity.combined(with: .scale(scale: 0.98, anchor: .top)), removal: .opacity))
                 if let footer { Text(footer).font(.system(size: 11)).foregroundStyle(.secondary).padding(.horizontal, 4).fixedSize(horizontal: false, vertical: true) }
             }
         }
