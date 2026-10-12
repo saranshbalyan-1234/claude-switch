@@ -1,0 +1,451 @@
+#!/bin/bash
+# Switch the Claude Code login (terminal and VS Code) between saved accounts.
+# Usage: claude-switch            switch to the next saved account (after the last comes the first)
+#        claude-switch <email>    switch to that account
+#        claude-switch save       save the account you're logged into now, e.g. right after /login
+#        claude-switch add [email]  keep the current login, sign in to another account, and save that one too
+#        claude-switch remove <email>  forget a saved account (not the one you're logged into now)
+#        claude-switch --quit-running [email]  quit running Claude sessions first (they'd switch you back), then switch
+#        claude-switch running    Claude sessions running now (for the menu bar app)
+#        claude-switch hooks [status|install|remove]  Claude Code hooks that tell the menu bar app what each session is doing
+#        claude-switch hook       the hook itself, for every event
+#        claude-switch request    the hook for permission prompts and questions, answered in the app when that's on
+#        claude-switch rules [list|remove <rule>]  the always-allow rules in Claude Code's user settings
+#        claude-switch recap [days]  what Claude did over the last days (default 7)
+#        claude-switch notify     Claude Code hook: tell you (and the menu bar app) that Claude is waiting on you
+# On macOS logins live in the Keychain; on Linux Claude keeps its login in ~/.claude/.credentials.json,
+# and saved copies go in ~/.claude/switch-logins (readable only by you).
+set -euo pipefail
+
+STORE=${CLAUDE_SWITCH_STORE:-$([ "$(uname)" = Darwin ] && echo keychain || echo file)}
+CRED_SVC=${CLAUDE_SWITCH_CRED_SVC:-Claude Code-credentials}          # Keychain: Claude's own item
+STASH_SVC=${CLAUDE_SWITCH_STASH_SVC:-claude-switch}                  # Keychain: one item per saved account
+CRED_FILE=${CLAUDE_SWITCH_CRED_FILE:-$HOME/.claude/.credentials.json}  # file store: Claude's own login
+STASH_DIR=${CLAUDE_SWITCH_STASH_DIR:-$HOME/.claude/switch-logins}      # file store: one file per saved account
+CONFIG=${CLAUDE_SWITCH_CONFIG:-$HOME/.claude.json}
+LIST=${CLAUDE_SWITCH_LIST:-$HOME/.claude/switch-accounts}
+ATTENTION=${CLAUDE_SWITCH_ATTENTION:-$HOME/.claude/switch-attention}
+ATTENTION_OFF=${CLAUDE_SWITCH_ATTENTION_OFF:-$HOME/.claude/switch-attention-off}  # exists = these notifications are turned off
+CLAUDE=${CLAUDE_SWITCH_CLAUDE:-$(command -v claude || echo "$HOME/.local/bin/claude")}
+SETTINGS=${CLAUDE_SWITCH_SETTINGS:-$HOME/.claude/settings.json}
+SESSIONS=${CLAUDE_SWITCH_SESSIONS:-$HOME/.claude/switch-sessions}  # one file per Claude session, written by the hook
+HOOK_CMD=${CLAUDE_SWITCH_HOOK_CMD:-$HOME/.local/bin/claude-switch hook}
+HOOK_EVENTS="SessionStart SessionEnd UserPromptSubmit PreToolUse PostToolUse Notification Stop SubagentStop PreCompact"
+REQUESTS=${CLAUDE_SWITCH_REQUESTS:-$HOME/.claude/switch-requests}  # permission prompts and questions waiting for the app
+APPROVALS_ON=${CLAUDE_SWITCH_APPROVALS_ON:-$HOME/.claude/switch-approvals-on}  # exists = answer them in the app
+LOG=${CLAUDE_SWITCH_LOG:-$HOME/.claude/switch-log}  # activity, for the weekly recap
+WAIT_FILE=${CLAUDE_SWITCH_WAIT_FILE:-$HOME/.claude/switch-request-wait}  # seconds a prompt waits for the app, set in the app
+US=$'\x1f'  # field separator in session files: unlike a tab, read keeps empty fields apart
+
+# Hook entry point, ahead of any login checks: it must never fail and never make Claude wait.
+if [ "${1:-}" = notify ]; then
+  mkdir -p "$(dirname "$ATTENTION")"; touch "$ATTENTION"
+  if [ "${2:-}" = clear ]; then : > "$ATTENTION"; exit 0; fi
+  [ -e "$ATTENTION_OFF" ] && exit 0
+  in=$(cat || true)
+  msg=$(jq -r '.message // .tool_input.questions[0].question // empty' <<<"$in" 2>/dev/null || true)
+  project=$(jq -r '.cwd // empty' <<<"$in" 2>/dev/null || true)
+  msg=${msg:-Claude needs your attention}; msg=${msg//$'\n'/ }; msg=${msg//$'\t'/ }
+  dir=${project:-$HOME}; project=$(basename "${project:-Claude}")
+  # Where the session runs, so the app can take you there: the hosting app's bundle id, and whether it's an editor extension.
+  host=${__CFBundleIdentifier:-}; where=terminal
+  case ${CLAUDE_CODE_ENTRYPOINT:-} in claude-vscode) where=editor ;; esac
+  label="$project · $([ $where = editor ] && echo "VS Code" || echo terminal)"
+  # Fields: time, project, message, folder, host app, editor|terminal, tty. Last 5 entries, rewritten in place
+  # (not moved) so the app's file watcher keeps working.
+  tty=$(ps -o tty= -p $$ 2>/dev/null | tr -d ' '); case $tty in ""|"?"*) tty= ;; *) tty=/dev/${tty#/dev/} ;; esac
+  { tail -n 4 "$ATTENTION"; printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" "$project" "$msg" "$dir" "$host" "$where" "$tty"; } > "$ATTENTION.new"
+  cat "$ATTENTION.new" > "$ATTENTION"; rm -f "$ATTENTION.new"
+  if [ -z "${CLAUDE_SWITCH_QUIET:-}" ]; then
+    # On macOS, Claude Switch.app sees the new line and posts the notification itself: clicking one takes you to the
+    # session, and it has a Delete button. (One posted with osascript would open Script Editor when clicked.)
+    if [ "$(uname)" != Darwin ] && command -v notify-send >/dev/null; then
+      notify-send "Claude is waiting: $label" "$msg" || true
+    fi
+  fi
+  exit 0
+fi
+
+die() { echo "claude-switch: $*" >&2; exit 1; }
+# get / put <live|saved> <account> [value]: live is Claude's own login, saved is this script's copy for an account.
+get() {
+  if [ "$STORE" = keychain ]; then
+    security find-generic-password -s "$([ "$1" = live ] && echo "$CRED_SVC" || echo "$STASH_SVC")" -a "$2" -w 2>/dev/null
+  else
+    cat "$([ "$1" = live ] && echo "$CRED_FILE" || echo "$STASH_DIR/$2.json")" 2>/dev/null
+  fi
+}
+put() {
+  if [ "$STORE" = keychain ]; then
+    # Through `security -i` on stdin so tokens never show up in `ps`.
+    printf 'add-generic-password -U -s "%s" -a "%s" -X "%s"\n' "$([ "$1" = live ] && echo "$CRED_SVC" || echo "$STASH_SVC")" "$2" \
+      "$(printf %s "$3" | xxd -p | tr -d '\n')" | security -i >/dev/null
+  else
+    local f; f=$([ "$1" = live ] && echo "$CRED_FILE" || echo "$STASH_DIR/$2.json")
+    mkdir -p "$(dirname "$f")"; [ "$1" = saved ] && chmod 700 "$STASH_DIR"
+    (umask 077; printf %s "$3" > "$f.tmp") && mv "$f.tmp" "$f"
+  fi
+  [ "$(get "$1" "$2")" = "$3" ] || die "could not save the $1 login for $2"
+}
+expired() { jq -e --argjson now "$(date +%s)000" '.claudeAiOauth.refreshTokenExpiresAt // empty | . < $now' <<<"$1" >/dev/null; }
+
+# Claude Code processes as "pid<TAB>editor|terminal": the native binary (named claude), or node running Claude's CLI.
+# VS Code's live in its extensions folder (anthropic.claude-code-*). CLAUDE_SWITCH_PROC_FILTER keeps tests to their own.
+claude_procs() {
+  ps -axo pid=,command= 2>/dev/null | awk -v only="${CLAUDE_SWITCH_PROC_FILTER:-}" '{
+    if (only != "" && index($0, only) == 0) next
+    n = split($2, a, "/"); b0 = a[n]; n = split($3, c, "/"); b1 = c[n]
+    if (b0 == "claude" || (b0 == "node" && (b1 == "claude" || $3 ~ /claude-code/)))
+      print $1 "\t" ($0 ~ /anthropic\.claude-code/ ? "editor" : "terminal")
+  }'
+}
+# The same, without this script's own ancestors, so a switch run from inside Claude never quits that Claude.
+running() {
+  local p=$$ mine=" $$ "
+  while p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ') && [ -n "$p" ] && [ "$p" -gt 1 ]; do mine="$mine$p "; done
+  claude_procs | while IFS=$'\t' read -r pid where; do
+    case $mine in *" $pid "*) ;; *) printf '%s\t%s\n' "$pid" "$where" ;; esac
+  done
+}
+
+# What `hooks install` adds: the hook for every event (async: Claude never waits for it), and `request` for permission
+# prompts and AskUserQuestion, which waits for an answer from the app but only when that's turned on and the app runs.
+REQUEST_CMD="${HOOK_CMD% hook} request"
+hooks_json() {  # settings.json as it would be after install|remove
+  jq --arg n "$HOOK_CMD" --arg r "$REQUEST_CMD" --arg ev "$HOOK_EVENTS" --arg op "$1" "$STRIP"' .hooks = strip
+    | if $op == "install" then
+        reduce ($ev | split(" "))[] as $e (.; .hooks[$e] += [{hooks: [{type: "command", command: $n, async: true}]}])
+        | .hooks.PermissionRequest += [{hooks: [{type: "command", command: $r, timeout: 86400}]}]
+        | .hooks.PreToolUse += [{matcher: "AskUserQuestion", hooks: [{type: "command", command: $r, timeout: 86400}]}]
+      else . end
+    | if .hooks == {} then del(.hooks) else . end' "$SETTINGS"
+}
+# What's missing from settings.json, one per line; none means the hooks are set up.
+hooks_missing() {
+  local want; want=$(printf '%s\n' $HOOK_EVENTS PermissionRequest AskUserQuestion)
+  [ -s "$SETTINGS" ] || { echo "$want"; return; }
+  jq -r --arg want "$want" '[(.hooks // {}) | to_entries[] | .key as $e | .value[]? | (.matcher // "") as $m | .hooks[]?.command? // empty | strings
+      | if contains("claude-switch hook") then $e elif contains("claude-switch request") then
+          (if $e == "PermissionRequest" then $e elif $e == "PreToolUse" and ($m | test("AskUserQuestion")) then "AskUserQuestion" else empty end)
+        else empty end] as $have
+    | ($want | split("\n") | map(select(. != ""))) - $have | .[]' "$SETTINGS"
+}
+# settings.json's hooks without this script's entries (including the older notify-only ones); everyone else's stay.
+STRIP='def strip: (.hooks // {}) | with_entries(.value |= map(select([.hooks[]?.command? // empty | strings
+  | select(test("claude-switch (hook|notify|request)"))] | length == 0))) | with_entries(select(.value | length > 0));'
+
+if [ "${1:-}" = hooks ]; then
+  case ${2:-status} in
+    status)
+      [ -s "$SETTINGS" ] && ! jq empty "$SETTINGS" 2>/dev/null && die "$SETTINGS isn't valid JSON"
+      missing=$(hooks_missing | paste -sd ' ' -)
+      if [ -z "$missing" ]; then echo "Claude hooks are set up."
+      elif [ "$(wc -w <<<"$missing" | tr -d ' ')" -ge 11 ]; then echo "Claude hooks are not set up: run claude-switch hooks install"; exit 1
+      else echo "Claude hooks are partly set up (missing: $missing): run claude-switch hooks install"; exit 1
+      fi ;;
+    preview)  # the change install (or remove) would make, as a diff
+      op=${3:-install}; [ -s "$SETTINGS" ] || echo '{}' > "$SETTINGS"
+      jq empty "$SETTINGS" 2>/dev/null || die "$SETTINGS isn't valid JSON"
+      diff -u --label "settings.json now" --label "settings.json after $op" <(jq . "$SETTINGS") <(hooks_json "$op") || true ;;
+    install|remove)
+      mkdir -p "$(dirname "$SETTINGS")"; [ -s "$SETTINGS" ] || echo '{}' > "$SETTINGS"
+      jq empty "$SETTINGS" 2>/dev/null || die "$SETTINGS isn't valid JSON; fix it, then try again"
+      new=$(hooks_json "$2")
+      cp "$SETTINGS" "$SETTINGS.before-claude-switch"
+      printf '%s\n' "$new" > "$SETTINGS"  # in place, so whatever watches the file keeps watching it
+      if [ "$2" = install ]; then
+        echo "Claude hooks set up (previous settings: $SETTINGS.before-claude-switch)."
+        echo "Claude sessions already running pick them up when restarted."
+      else
+        echo "Claude hooks removed (previous settings: $SETTINGS.before-claude-switch)."
+      fi ;;
+    *) die "usage: claude-switch hooks [status|preview [install|remove]|install|remove]" ;;
+  esac
+  exit 0
+fi
+
+# Allow/Deny and answers from the app: on only while the app runs and this is turned on in its settings.
+approvals_live() { [ -e "$APPROVALS_ON" ] && { [ -n "${CLAUDE_SWITCH_ASSUME_APP:-}" ] || pgrep -x ClaudeSwitch >/dev/null 2>&1; }; }
+# The terminal a session runs in (hooks share Claude's), for jumping to that exact tab; none in an editor.
+my_tty() { local t; t=$(ps -o tty= -p $$ 2>/dev/null | tr -d ' '); case $t in ""|"?"*) ;; *) echo "/dev/${t#/dev/}" ;; esac; }
+
+# Claude Code hook for every event (see hooks install): keeps one file per session saying what it's doing, for the
+# menu bar app, logs activity for the weekly recap, and passes the moments Claude waits on you to notify.
+# Like notify, it must never fail or make Claude wait.
+if [ "${1:-}" = hook ]; then
+  set +euo pipefail
+  in=$(cat)
+  IFS=$US read -r ev sid dir tool ntype src msg <<<"$(jq -r '[.hook_event_name, .session_id, .cwd, .tool_name, .notification_type, .source, .message]
+    | map(. // "" | tostring | gsub("[\t\n\r\u001f]"; " ")) | join("\u001f")' <<<"$in" 2>/dev/null)"
+  sid=$(printf %s "$sid" | tr -cd 'A-Za-z0-9_-')
+  [ -n "$sid" ] || exit 0
+  mkdir -p "$SESSIONS"; f=$SESSIONS/$sid
+  [ "$ev" = SessionEnd ] && { rm -f "$f" "$f.files"; exit 0; }
+  now=$(date +%s); status=; opid=; acct=; started=; tty=
+  [ -f "$f" ] && IFS=$US read -r _ _ status _ _ _ _ opid acct started tty < "$f"
+  # The Claude process this hook runs under: the nearest ancestor that is one.
+  procs=$(printf '\n%s\n' "$(claude_procs)"); p=$PPID; pid=
+  for _ in 1 2 3 4 5 6; do
+    case $procs in *$'\n'"$p"$'\t'*) pid=$p; break ;; esac
+    p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')
+    [ -n "$p" ] && [ "$p" -gt 1 ] || break
+  done
+  # A process keeps the login it started with. So the account is read once per process: when it is first seen.
+  if [ -z "$acct" ] || [ "$pid" != "$opid" ]; then acct=$(jq -r '.oauthAccount.emailAddress // empty' "$CONFIG" 2>/dev/null); tty=$(my_tty); fi
+  project=$(basename "${dir:-$HOME}"); add=0; del=0
+  case $ev in
+    SessionStart) [ "$src" = resume ] && status=Resumed || status=Started ;;
+    UserPromptSubmit|SubagentStop) status=Working ;;
+    PostToolUse)
+      status=Working
+      # Lines added and removed by a file edit, from the tool's own input: a real line diff for Edit, every line for Write.
+      case $tool in
+        Edit|MultiEdit|Write)
+          file=$(jq -r '.tool_input.file_path // empty' <<<"$in")
+          if [ "$tool" = Write ]; then
+            add=$(jq -r '.tool_input.content // "" | if . == "" then 0 else (rtrimstr("\n") | split("\n") | length) end' <<<"$in")
+          else
+            n=$(jq '[.tool_input.edits // [.tool_input] | .[] | select(.old_string != null)] | length' <<<"$in")
+            for ((k = 0; k < n; k++)); do
+              d=$(diff <(jq -r --argjson k "$k" '(.tool_input.edits // [.tool_input])[$k].old_string' <<<"$in") \
+                       <(jq -r --argjson k "$k" '(.tool_input.edits // [.tool_input])[$k].new_string' <<<"$in"))
+              add=$((add + $(grep -c '^>' <<<"$d"))); del=$((del + $(grep -c '^<' <<<"$d")))
+            done
+          fi
+          if [ -n "$file" ]; then
+            status="Edited $(basename "$file") (+$add −$del)"
+            # Per session: each file touched with its running totals, newest last.
+            { [ -f "$f.files" ] && awk -F"$US" -v p="$file" '$1 != p' "$f.files"
+              old=$( [ -f "$f.files" ] && awk -F"$US" -v p="$file" '$1 == p { print $2 + 0, $3 + 0 }' "$f.files")
+              printf "%s$US%s$US%s\n" "$file" $(( ${old% *} + add )) $(( ${old#* } + del )); } > "$f.files.$$" 2>/dev/null
+            mv -f "$f.files.$$" "$f.files"
+          fi ;;
+      esac ;;
+    PreToolUse) [ "$tool" = AskUserQuestion ] && status="Asking you a question" || status="Running ${tool:-a tool}" ;;
+    Notification) status=${msg:-Waiting for you} ;;
+    Stop) status=Done ;;
+    PreCompact) status=Compacting ;;
+  esac
+  host=${__CFBundleIdentifier:-}; where=terminal
+  [ "${CLAUDE_CODE_ENTRYPOINT:-}" = claude-vscode ] && where=editor
+  # Fields: updated, event, status, project, folder, editor|terminal, host app, pid, account, started, tty.
+  # Written aside and moved in, so a reader never sees half a file.
+  printf "%s$US" "$now" "$ev" "$status" "$project" "${dir:-$HOME}" "$where" "$host" "$pid" "$acct" "${started:-$now}" > "$f.$$"
+  printf '%s\n' "$tty" >> "$f.$$"; mv -f "$f.$$" "$f"
+  # Activity log for the recap: time, event, project, account, tool, lines added, removed. Trimmed to 5 weeks when large.
+  case $ev in
+    SessionStart|UserPromptSubmit|PostToolUse)
+      printf "%s$US%s$US%s$US%s$US%s$US%s$US%s\n" "$now" "$ev" "$project" "$acct" "$tool" "$add" "$del" >> "$LOG"
+      if [ "$(wc -c < "$LOG")" -gt 2000000 ]; then
+        awk -F"$US" -v t=$((now - 35 * 86400)) '$1 >= t' "$LOG" > "$LOG.$$" && mv -f "$LOG.$$" "$LOG"
+      fi ;;
+  esac
+  case $ev in
+    UserPromptSubmit) "$0" notify clear ;;
+    Notification) case $ntype in ""|permission_prompt|idle_prompt|elicitation_dialog) printf %s "$in" | "$0" notify ;; esac ;;
+    PreToolUse) [ "$tool" = AskUserQuestion ] && ! approvals_live && printf %s "$in" | "$0" notify ;;
+  esac
+  exit 0
+fi
+
+# Always-allow rules in Claude Code's user settings (permissions.allow): list them, or remove one.
+if [ "${1:-}" = rules ]; then
+  [ -s "$SETTINGS" ] || { [ "${2:-list}" = list ] && exit 0; die "no $SETTINGS"; }
+  case ${2:-list} in
+    list) jq -r '.permissions.allow // [] | .[]' "$SETTINGS" ;;
+    remove)
+      [ -n "${3:-}" ] || die "usage: claude-switch rules remove <rule>"
+      new=$(jq --arg r "$3" '.permissions.allow = ((.permissions.allow // []) - [$r])' "$SETTINGS") && printf '%s\n' "$new" > "$SETTINGS"
+      echo "Removed $3" ;;
+    *) die "usage: claude-switch rules [list|remove <rule>]" ;;
+  esac
+  exit 0
+fi
+
+# Claude Code hook for permission prompts and AskUserQuestion (see hooks install). With answering in the app turned on
+# and the app running, it puts the request where the app shows it and waits for the answer; otherwise, or when the
+# answer is "in Claude" or doesn't come in time, it says nothing and Claude asks the usual way.
+if [ "${1:-}" = request ]; then
+  set +euo pipefail
+  in=$(cat)
+  approvals_live || exit 0
+  ev=$(jq -r '.hook_event_name // empty' <<<"$in"); tool=$(jq -r '.tool_name // empty' <<<"$in")
+  case $ev in
+    PermissionRequest) kind=permission ;;
+    PreToolUse) [ "$tool" = AskUserQuestion ] && kind=question || exit 0 ;;
+    *) exit 0 ;;
+  esac
+  mkdir -p "$REQUESTS"; id=$(date +%s)-$$; r=$REQUESTS/$id
+  where=terminal; [ "${CLAUDE_CODE_ENTRYPOINT:-}" = claude-vscode ] && where=editor
+  # What the change looks like, for edits: a unified diff of each replacement, or the new file's lines.
+  diff=
+  case $tool in
+    Edit|MultiEdit)
+      file=$(jq -r '.tool_input.file_path // ""' <<<"$in"); n=$(jq '[.tool_input.edits // [.tool_input] | .[] | select(.old_string != null)] | length' <<<"$in")
+      for ((k = 0; k < n; k++)); do
+        diff+=$(diff -U 2 --label "$(basename "$file")" --label "$(basename "$file")" \
+          <(jq -r --argjson k "$k" '(.tool_input.edits // [.tool_input])[$k].old_string' <<<"$in") \
+          <(jq -r --argjson k "$k" '(.tool_input.edits // [.tool_input])[$k].new_string' <<<"$in") | tail -n +3)$'\n'
+      done ;;
+    Write) diff=$(jq -r '.tool_input.content // "" | split("\n") | .[0:80] | map("+" + .) | join("\n")' <<<"$in") ;;
+  esac
+  diff=$(head -n 150 <<<"$diff")
+  # The rule "Always allow" would add: Claude's own suggestion when it gives one, otherwise one worked out here
+  # (a command and its first word, or two for tools like npm and git; a website's domain; the tool for edits and MCP).
+  always=$(jq -r '
+    def words: split(" ") | map(select(. != ""));
+    if ((.permission_suggestions // []) | length) > 0 then
+      [.permission_suggestions[] | .rules[]? | .toolName + (if (.ruleContent // "") != "" then "(" + .ruleContent + ")" else "" end)] | join(", ")
+    elif .tool_name == "Bash" then
+      (.tool_input.command // "" | words) as $w
+      | ($w[0] // "") as $c
+      | if $c == "" then "Bash" else "Bash(" + (if (["npm","npx","pnpm","yarn","bun","git","python","python3","go","cargo","make","docker","kubectl","gh","swift","xcodebuild"] | index($c)) and ($w | length) > 1 then $c + " " + $w[1] else $c end) + ":*)" end
+    elif .tool_name == "WebFetch" then
+      "WebFetch(domain:" + ((.tool_input.url // "") | sub("^[a-z]+://"; "") | split("/")[0]) + ")"
+    else .tool_name end' <<<"$in")
+  jq -c --arg id "$id" --arg kind "$kind" --arg where "$where" --arg host "${__CFBundleIdentifier:-}" --arg tty "$(my_tty)" --arg now "$(date +%s)" \
+        --arg diff "$diff" --arg always "$always" '
+    {id: $id, kind: $kind, at: ($now | tonumber), session: (.session_id // ""), folder: (.cwd // ""), project: ((.cwd // "") | split("/") | last // ""),
+     where: $where, host: $host, tty: $tty, tool: (.tool_name // ""), diff: $diff, always: $always,
+     detail: ((.tool_input // {}) | (.command // .file_path // .url // .pattern // .query // .prompt // tostring) | tostring | .[0:600]),
+     description: ((.tool_input.description // "") | tostring),
+     questions: [(.tool_input.questions // [])[] | {question: (.question // ""), header: (.header // ""), multiSelect: (.multiSelect // false),
+                  options: [(.options // [])[] | {label: (.label // ""), description: (.description // "")}]}]}' <<<"$in" > "$r.tmp" \
+    && mv -f "$r.tmp" "$r.json" || exit 0
+  # The app answers by writing $r.answer: allow, always, deny, claude (ask in Claude), dismiss (a question, unanswered),
+  # or for a question {"answers":[...]}. How long to wait is set in the app (default 5 minutes).
+  wait=${CLAUDE_SWITCH_REQUEST_WAIT:-$(cat "$WAIT_FILE" 2>/dev/null)}; wait=${wait:-300}
+  for ((i = 0; i < wait * 10; i++)); do [ -s "$r.answer" ] && break; sleep 0.1; done
+  ans=$(cat "$r.answer" 2>/dev/null); rm -f "$r.json" "$r.answer"
+  allow='{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}'
+  case $kind:$ans in
+    permission:allow) echo "$allow" ;;
+    permission:always)
+      if [ "$(jq '(.permission_suggestions // []) | length' <<<"$in")" -gt 0 ]; then
+        jq -c '{hookSpecificOutput: {hookEventName: "PermissionRequest", decision: {behavior: "allow", updatedPermissions: .permission_suggestions}}}' <<<"$in"
+      else
+        # Added to the user settings' allow list, so it holds in every project from now on.
+        [ -s "$SETTINGS" ] || echo '{}' > "$SETTINGS"
+        new=$(jq --arg r "$always" '.permissions.allow = (((.permissions.allow // []) + [$r]) | unique)' "$SETTINGS") && printf '%s\n' "$new" > "$SETTINGS"
+        echo "$allow"
+      fi ;;
+    permission:deny) echo '{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"deny","message":"Denied from Claude Switch"}}}' ;;
+    question:dismiss)
+      echo '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"The user dismissed this question in Claude Switch without answering. Carry on with your best judgement, or ask again differently if you must."}}' ;;
+    question:\{*)
+      jq -c '{hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: "deny",
+        permissionDecisionReason: ("The user already answered in Claude Switch, so do not ask again. " +
+          ([.answers[] | "\"\(.question)\" → \(.answer)"] | join("; ")))}}' <<<"$ans" 2>/dev/null ;;
+  esac
+  exit 0
+fi
+
+# Activity over the last N days (default 7), from the hooks' log: for the weekly recap.
+if [ "${1:-}" = recap ]; then
+  days=${2:-7}; [ -s "$LOG" ] || { echo "No activity recorded yet: it's collected once the Claude hooks are set up."; exit 0; }
+  awk -F"$US" -v since=$(( $(date +%s) - days * 86400 )) -v days="$days" '
+    $1 < since { next }
+    $2 == "SessionStart" { sessions++ }
+    $2 == "UserPromptSubmit" { prompts++; byproj[$3]++; if ($4 != "") byacct[$4]++ }
+    $2 == "PostToolUse" { tools++; if ($5 == "Edit" || $5 == "MultiEdit" || $5 == "Write") { edits++; add += $6; del += $7 } }
+    function top(a, n,   k, out, best, bk, i) {
+      out = ""
+      for (i = 0; i < n; i++) { best = 0; bk = ""; for (k in a) if (a[k] > best) { best = a[k]; bk = k }
+        if (bk == "") break; out = out (out == "" ? "" : ", ") bk " (" best ")"; delete a[bk] }
+      return out
+    }
+    END {
+      printf "Last %d days: %d sessions, %d prompts, %d tool uses\n", days, sessions, prompts, tools
+      printf "Edits: %d, +%d −%d lines\n", edits, add, del
+      p = top(byproj, 3); if (p != "") print "Top projects (prompts): " p
+      a = top(byacct, 4); if (a != "") print "By account (prompts): " a
+    }' "$LOG"
+  exit 0
+fi
+
+# For the menu bar app: Claude sessions running now, one "pid<TAB>editor|terminal" per line.
+[ "${1:-}" = running ] && { running; exit 0; }
+
+# Running Claude sessions keep the old login in memory and write it back (to ~/.claude.json and the Keychain)
+# when they save or refresh it, which undoes a switch. --quit-running quits them first.
+quit_running=false
+[ "${1:-}" = --quit-running ] && { quit_running=true; shift; }
+
+# Ahead of the login checks: adding works when logged out too. Signing in replaces the live login, so save it first.
+if [ "${1:-}" = add ]; then
+  was=$(jq -r '.oauthAccount.emailAddress // empty' "$CONFIG" 2>/dev/null || true)
+  "$0" save >/dev/null 2>&1 || true
+  echo "Sign in with the account to add.${was:+ If the browser picks $was, sign out of claude.ai there and try again.}"
+  "$CLAUDE" auth login ${2:+--email "$2"} || die "sign-in did not finish"
+  "$0" save
+  [ "$(jq -r '.oauthAccount.emailAddress // empty' "$CONFIG")" = "$was" ] && echo "Still on $was: no new account was added."
+  exit 0
+fi
+
+# Ahead of the login checks: removing works when logged out too. The current login is refused, since every run saves it again.
+if [ "${1:-}" = remove ]; then
+  gone=${2:-}; [ -n "$gone" ] || die "usage: claude-switch remove <email>"
+  touch "$LIST"; grep -qxF "$gone" "$LIST" || die "$gone is not saved. Saved accounts: $(paste -sd ' ' "$LIST")"
+  [ "$(jq -r '.oauthAccount.emailAddress // empty' "$CONFIG" 2>/dev/null || true)" = "$gone" ] \
+    && die "you're logged in as $gone; switch to another account first, then remove it"
+  if [ "$STORE" = keychain ]; then
+    security delete-generic-password -s "$STASH_SVC" -a "$gone" >/dev/null 2>&1 || true
+  else
+    rm -f "$STASH_DIR/$gone.json"
+  fi
+  # Rewritten in place, not replaced, so the menu bar app's file reads keep working.
+  rest=$(grep -vxF "$gone" "$LIST" || true); printf '%s' "${rest:+$rest$'\n'}" > "$LIST"
+  echo "Removed $gone. Saved accounts: $(paste -sd ' ' "$LIST")"
+  exit 0
+fi
+
+if $quit_running; then
+  pids=$(running | cut -f1 | paste -sd ' ' -)
+  if [ -n "$pids" ]; then
+    kill -TERM $pids 2>/dev/null || true
+    alive=$pids
+    for _ in $(seq 50); do
+      alive=$(for p in $alive; do kill -0 "$p" 2>/dev/null && echo "$p"; done) || true
+      [ -z "$alive" ] && break
+      sleep 0.1
+    done
+    echo "Quit $(wc -w <<<"$pids" | tr -d ' ') Claude session(s)."
+    [ -n "$alive" ] && echo "Still running after 5 seconds (pid $(paste -sd ' ' - <<<"$alive")): they may switch you back."
+  fi
+fi
+
+cur=$(jq -r '.oauthAccount.emailAddress // empty' "$CONFIG")
+creds=$(get live "$USER") || creds='{}'
+logged_in=false
+if [ -n "$cur" ] && jq -e .claudeAiOauth.refreshToken <<<"$creds" >/dev/null; then
+  logged_in=true
+  # Never save tokens under an account whose metadata disagrees.
+  [ "$(jq -r .organizationUuid <<<"$creds")" = "$(jq -r .oauthAccount.organizationUuid "$CONFIG")" ] \
+    || die "the saved login and $CONFIG disagree; quit all Claude sessions, run /login, then retry"
+  put saved "$cur" "$(jq -ac --argjson a "$(jq .oauthAccount "$CONFIG")" '{claudeAiOauth, organizationUuid, oauthAccount: $a}' <<<"$creds")"
+  touch "$LIST"; grep -qxF "$cur" "$LIST" || echo "$cur" >> "$LIST"
+elif [ "${1:-}" = save ]; then
+  die "not logged in; run claude and /login first"
+fi
+[ "${1:-}" = save ] && { echo "Saved $cur. Saved accounts: $(paste -sd ' ' "$LIST")"; exit 0; }
+[ -s "$LIST" ] || die "no saved accounts; use Add account to sign in"
+
+target=${1:-$(grep -A1 -xF "$cur" "$LIST" | sed -n 2p)}
+target=${target:-$(head -1 "$LIST")}
+if [ "$target" = "$cur" ] && $logged_in; then
+  [ $# -gt 0 ] && echo "Already on $cur." || echo "Only $cur is saved. /login with another account, then run claude-switch save."
+  exit 0
+fi
+
+stash=$(get saved "$target") || die "no saved login for $target. Saved accounts: $(paste -sd ' ' "$LIST")"
+# Only the Claude login changes; MCP server tokens in the same item stay as they are.
+put live "$USER" "$(jq -ac --argjson s "$stash" '.claudeAiOauth = $s.claudeAiOauth | .organizationUuid = $s.organizationUuid' <<<"$creds")"
+tmp=$(mktemp); jq --argjson s "$stash" '.oauthAccount = $s.oauthAccount' "$CONFIG" > "$tmp" && mv "$tmp" "$CONFIG"
+
+echo "Switched: $cur -> $target"
+expired "$stash" && echo "The saved login for $target has expired: run /login in Claude, then claude-switch save."
+still=$(running)
+if [ -n "$still" ]; then
+  ed=$(grep -c $'\teditor$' <<<"$still" || true); te=$(grep -c $'\tterminal$' <<<"$still" || true)
+  echo "Claude is still running ($ed in VS Code, $te in a terminal) with ${cur:-the old login}: quit and reopen those sessions, or they switch you back when they save."
+fi

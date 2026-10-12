@@ -1,0 +1,5 @@
+# Build output and the dev builder's scratch folder
+dist/
+.dev/
+*.zip
+.DS_Store
