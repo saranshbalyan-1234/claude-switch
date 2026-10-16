@@ -225,7 +225,12 @@ struct HintLine: View {
 }
 
 // A row that highlights on hover, runs `action` on click, and shows `accessory` (e.g. a delete button) while hovered.
+// The island's panel never becomes the active window, so onHover doesn't fire there: it shows row buttons all the time.
+private struct AlwaysShowAccessoryKey: EnvironmentKey { static let defaultValue = false }
+extension EnvironmentValues { var alwaysShowAccessory: Bool { get { self[AlwaysShowAccessoryKey.self] } set { self[AlwaysShowAccessoryKey.self] = newValue } } }
+
 struct HoverRow<Content: View, Accessory: View>: View {
+    @Environment(\.alwaysShowAccessory) private var always
     var action: (() -> Void)? = nil
     @ViewBuilder var content: Content
     @ViewBuilder var accessory: Accessory
@@ -234,7 +239,7 @@ struct HoverRow<Content: View, Accessory: View>: View {
         HStack(spacing: 10) {
             content
             Spacer(minLength: 4)
-            accessory.opacity(hover ? 1 : 0)
+            accessory.opacity(hover || always ? 1 : 0)
         }
         .padding(.horizontal, 8).padding(.vertical, 6)
         .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(Color.primary.opacity(hover && action != nil ? 0.06 : 0)))

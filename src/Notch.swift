@@ -23,6 +23,12 @@ final class NotchPanel: NSPanel {
     override var canBecomeKey: Bool { true }  // for the buttons in cards; it never takes focus on its own
 }
 
+// The panel isn't key until clicked, and by default that first click only makes it key: a button (the X on a row,
+// Allow, Send) needed a second click whenever the island opened while another app was in front.
+final class FirstClickHost<V: View>: NSHostingView<V> {
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+}
+
 final class Notch {
     let app: App, model = NotchModel(), panel: NotchPanel
     var poll: Timer?, hoverSince: Date?, outSince: Date?
@@ -38,7 +44,7 @@ final class Notch {
         panel.hasShadow = false
         panel.isMovable = false
         panel.hidesOnDeactivate = false
-        panel.contentView = NSHostingView(rootView: NotchView(model: model, collapse: { [weak self] in self?.dismiss() }).environmentObject(app))
+        panel.contentView = FirstClickHost(rootView: NotchView(model: model, collapse: { [weak self] in self?.dismiss() }).environmentObject(app))
         NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { [weak self] _ in
             self?.layout()
         }
@@ -225,6 +231,7 @@ struct NotchView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .environment(\.colorScheme, .dark)
+        .environment(\.alwaysShowAccessory, true)
     }
 
     var working: [Live] { app.sessions.filter { $0.state == .working } }
